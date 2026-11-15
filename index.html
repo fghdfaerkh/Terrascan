@@ -572,85 +572,178 @@ body:not([data-v="home"])::before{position:fixed;inset:0;height:auto;background:
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 'use strict';
 window.TSAUTH=(function(){
-const K='tsa:',enc=new TextEncoder(),dec=new TextDecoder(),ITER=310000,IDLE=30*60*1000;
+const SB_URL='https://katwhuusewxxdqcknwno.supabase.co';
+const SB_KEY='sb_publishable_4gP82wvI7nhzHkaWv_AByg_M7Yjq6';   // publishable key: public by design, data is protected by RLS
+const K='tsa:';
 const g=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const b64=u=>{u=new Uint8Array(u);let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
-const unb=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
-const rd=(k,d)=>{try{const v=JSON.parse(localStorage.getItem(K+k));return v==null?d:v}catch(e){return d}};
-const wr=(k,v)=>{try{localStorage.setItem(K+k,JSON.stringify(v));return true}catch(e){return false}};
-const T={user:null,vault:{},key:null};
-const NAMES=['ts_p','ts_s','ts_u','ts_h','ts_h2'];
+const T={user:null,vault:{}};
+const REDIRECT=location.origin+location.pathname;
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NAMES=['ts_s','ts_u','ts_h2'];
 const COMMON=['password','password1','qwerty','qwerty123','123456','12345678','1234567890','12345678910','111111','abc123','йцукен','admin','letmein','iloveyou'];
-let resolveReady,gateFirst=false;const ready=new Promise(r=>resolveReady=r);
-
-async function derive(pw,salt,iter){
-  const m=await crypto.subtle.importKey('raw',enc.encode(pw.normalize('NFKC')),'PBKDF2',false,['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt,iterations:iter},m,{name:'AES-GCM',length:256},true,['encrypt','decrypt']);
+const okNum=x=>typeof x==='number'&&isFinite(x);
+function newId(){
+  if(window.crypto&&crypto.randomUUID)return crypto.randomUUID();
+  const b=crypto.getRandomValues(new Uint8Array(16));b[6]=b[6]&15|64;b[8]=b[8]&63|128;
+  const h=Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join('');
+  return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
 }
-async function seal(key,obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(JSON.stringify(obj)));return{iv:b64(iv),ct:b64(ct)}}
-async function open(key,r){const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb(r.iv)},key,unb(r.ct));return JSON.parse(dec.decode(pt))}
+let sb=null;
+try{
+  if(window.supabase&&window.supabase.createClient)
+    sb=window.supabase.createClient(SB_URL,SB_KEY,{auth:{flowType:'pkce',persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+}catch(e){sb=null}
+let resolveReady,gateFirst=false,isReady=false,recovery=false,leaving=false,purgeGuest=false,lastReport=0;
+const ready=new Promise(r=>resolveReady=r);
+
+/* ---------- helpers ---------- */
 const normEmail=e=>String(e||'').trim().toLowerCase();
 const okEmail=e=>e.length<=120&&/^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/.test(e);
 function policy(p,e){
   if(p.length<8)return'Password is shorter than 8 characters.';
   if(!/[A-Za-zА-Яа-яЁё]/.test(p)||!/\d/.test(p))return'Use letters and at least one digit.';
   if(COMMON.includes(p.toLowerCase())||/^(.)\1+$/.test(p))return'Password is too simple.';
-  const l=e.split('@')[0].toLowerCase();if(l.length>=4&&p.toLowerCase().includes(l))return'Password must not contain your email.';
+  const l=String(e||'').split('@')[0].toLowerCase();if(l.length>=4&&p.toLowerCase().includes(l))return'Password must not contain your email.';
   return'';
 }
 function meter(p){const s=(p.length>=8)+(p.length>=14)+(/[a-zа-я]/.test(p)&&/[A-ZА-Я]/.test(p))+/[^\wа-яё]/i.test(p);return p?['very weak','weak','medium','good','strong'][s]:''}
-const secure=()=>window.crypto&&crypto.subtle;
-function waitLeft(e){const f=rd('f',{})[e];return f&&f.until>Date.now()?Math.ceil((f.until-Date.now())/1000):0}
-function failed(e){const a=rd('f',{}),f=a[e]||{n:0};f.n++;if(f.n>=5)f.until=Date.now()+Math.min(900,30*2**(f.n-5))*1000;a[e]=f;wr('f',a)}
-function cleared(e){const a=rd('f',{});delete a[e];wr('f',a)}
+function tr(e){
+  const m=String((e&&e.message)||e||'');
+  if(/invalid login credentials/i.test(m))return'Incorrect email or password.';
+  if(/email not confirmed/i.test(m))return'Confirm your email first: check your inbox for the link.';
+  if(/already registered|already been registered/i.test(m))return'This email is already registered. Please log in.';
+  if(/rate limit|too many|security purposes/i.test(m)||(e&&e.status===429))return'Too many attempts. Try again in a minute.';
+  if(/failed to fetch|networkerror|load failed/i.test(m))return'No connection to the server.';
+  if(/relation .* does not exist|schema cache/i.test(m))return'Database tables are missing: run the SQL schema in Supabase.';
+  return m||'Error.';
+}
+function toast(msg,good){
+  let d=g('tstoast');
+  if(!d){d=document.createElement('div');d.id='tstoast';d.setAttribute('role','alert');
+    d.style.cssText='position:fixed;left:16px;right:16px;bottom:16px;max-width:520px;margin:auto;z-index:5000;padding:12px 16px;border-radius:10px;background:var(--surface);color:var(--fg);font-size:13.5px;box-shadow:0 4px 24px rgba(0,0,0,.25)';
+    document.body.appendChild(d)}
+  d.style.border='1px solid '+(good?'var(--good)':'var(--bad)');
+  d.textContent=msg;clearTimeout(d._t);d._t=setTimeout(()=>d.remove(),9000);
+}
+function stable(o){
+  if(Array.isArray(o))return'['+o.map(stable).join(',')+']';
+  if(o&&typeof o==='object')return'{'+Object.keys(o).sort().map(k=>JSON.stringify(k)+':'+stable(o[k])).join(',')+'}';
+  return JSON.stringify(o===undefined?null:o);
+}
 
-async function startSession(email,id,key,vault){
-  T.user={email,id};T.key=key;T.vault=vault;
-  sessionStorage.setItem(K+'s',JSON.stringify({email,id,k:b64(await crypto.subtle.exportKey('raw',key)),exp:Date.now()+IDLE}));
-  watchIdle();
+/* ---------- vault: local cache of the user's data, synced with Supabase ---------- */
+const synced={p:undefined,s:undefined,h:{}};   // undefined = must be written, string = last written snapshot, null = exists on server (adopt)
+const dropped={};
+let chain=Promise.resolve(),ft=0;
+const fromRow=r=>({id:r.id,t:Date.parse(r.updated_at)||Date.now(),name:r.name||'',pn:r.point_name||'Selected point',la:r.lat,lo:r.lon,
+  a:r.area_ha==null?null:+r.area_ha,rot:r.rotation||'',c:r.climate,w:r.weights,poly:r.polygon,pa:r.plan_area==null?null:+r.plan_area,pm:r.plan_mode});
+function toRow(e,uid){
+  return{id:e.id,user_id:uid,name:String(e.name||'').slice(0,60),point_name:String(e.pn||'Selected point').slice(0,60),
+    lat:e.la,lon:e.lo,area_ha:okNum(e.a)&&e.a>=0?e.a:null,polygon:Array.isArray(e.poly)?e.poly:null,
+    weights:e.w&&typeof e.w==='object'?e.w:null,rotation:String(e.rot||'').slice(0,60),
+    plan_area:okNum(e.pa)&&e.pa>0?e.pa:null,plan_mode:e.pm==='split'?'split':'all',climate:Array.isArray(e.c)?e.c:null};
 }
-let idleOn=false,lastBump=0;
-function sess(){try{return JSON.parse(sessionStorage.getItem(K+'s'))}catch(e){return null}}
-function bump(){const n=Date.now();if(n-lastBump<10000)return;lastBump=n;const s=sess();if(s){s.exp=n+IDLE;sessionStorage.setItem(K+'s',JSON.stringify(s))}}
-function watchIdle(){if(idleOn)return;idleOn=true;['pointerdown','keydown','scroll'].forEach(e=>addEventListener(e,bump,{passive:true}));setInterval(()=>{const s=sess();if(!s||s.exp<Date.now())logout()},20000)}
-async function restore(){
-  try{const s=sess();if(!s||s.exp<Date.now())return false;
-    const key=await crypto.subtle.importKey('raw',unb(s.k),'AES-GCM',true,['encrypt','decrypt']);
-    T.vault=await open(key,rd('v:'+s.id));T.user={email:s.email,id:s.id};T.key=key;watchIdle();return true;
-  }catch(e){sessionStorage.removeItem(K+'s');return false}
+async function loadVault(){
+  const uid=T.user.id;
+  const res=await Promise.all([
+    sb.from('profiles').select('name,color,created_at').eq('id',uid).maybeSingle(),
+    sb.from('user_state').select('selection,ui').eq('user_id',uid).maybeSingle(),
+    sb.from('saves').select('*').order('updated_at',{ascending:false}).limit(30)]);
+  res.forEach(r=>{if(r.error)throw r.error});
+  const p=res[0].data,s=res[1].data,h=res[2].data||[],v={};
+  synced.p=undefined;synced.s=undefined;synced.h={};
+  if(p){v.ts_p={name:p.name,color:p.color,since:Date.parse(p.created_at)||Date.now()};synced.p=stable([v.ts_p.name,v.ts_p.color])}
+  if(s){v.ts_s=s.selection||{};v.ts_u=s.ui||{};synced.s=stable([v.ts_s,v.ts_u])}
+  v.ts_h2=h.map(fromRow);
+  h.forEach(r=>{synced.h[r.id]=null});
+  if(!s&&!h.length){   // empty account: take over what the user did as a guest in this browser
+    const gv={};
+    NAMES.forEach(n=>{try{const o=JSON.parse(localStorage.getItem('ts:ck:'+n));if(o&&o.v!=null)gv[n]=o.v}catch(e){}});
+    if(gv.ts_s||gv.ts_u||(Array.isArray(gv.ts_h2)&&gv.ts_h2.length)){
+      if(gv.ts_s&&typeof gv.ts_s==='object')v.ts_s=gv.ts_s;
+      if(gv.ts_u&&typeof gv.ts_u==='object')v.ts_u=gv.ts_u;
+      if(Array.isArray(gv.ts_h2))v.ts_h2=gv.ts_h2.filter(e=>e&&typeof e==='object').map(e=>Object.assign({},e,{id:UUID.test(e.id)?e.id:newId()}));
+      purgeGuest=true;
+    }
+  }
+  T.vault=v;
 }
-let ft=0;
+async function syncAll(){
+  if(!T.user||!sb)return;
+  const uid=T.user.id,v=T.vault,must=r=>{if(r.error)throw r.error};
+  if(dropped.ts_h2){must(await sb.from('saves').delete().eq('user_id',uid));synced.h={};delete dropped.ts_h2}
+  if(dropped.ts_s||dropped.ts_u){must(await sb.from('user_state').delete().eq('user_id',uid));synced.s=undefined;delete dropped.ts_s;delete dropped.ts_u}
+  if(dropped.ts_p){must(await sb.from('profiles').upsert({id:uid,name:'Guest',color:0}));synced.p=undefined;delete dropped.ts_p}
+  const p=v.ts_p;
+  if(p&&typeof p==='object'){
+    const j=stable([p.name,p.color]);
+    if(synced.p!==j){must(await sb.from('profiles').upsert({id:uid,name:String(p.name||'').slice(0,30)||'Guest',color:p.color>=0&&p.color<=5?p.color|0:0}));synced.p=j}
+  }
+  if(v.ts_s||v.ts_u){
+    const j=stable([v.ts_s||{},v.ts_u||{}]);
+    if(synced.s!==j){must(await sb.from('user_state').upsert({user_id:uid,selection:v.ts_s||{},ui:v.ts_u||{}}));synced.s=j}
+  }
+  const h=v.ts_h2;
+  if(Array.isArray(h)){
+    const cur={},rows=[];
+    h.forEach(e=>{
+      if(!e||!UUID.test(e.id)||!okNum(e.la)||!okNum(e.lo)||Math.abs(e.la)>90||Math.abs(e.lo)>180)return;
+      const r=toRow(e,uid),j=stable([r,e.t]);cur[e.id]=j;
+      if(!(e.id in synced.h))rows.push(r);
+      else if(synced.h[e.id]!==null&&synced.h[e.id]!==j)rows.push(r);
+    });
+    if(rows.length)must(await sb.from('saves').upsert(rows));
+    const gone=Object.keys(synced.h).filter(id=>!(id in cur));
+    if(gone.length)must(await sb.from('saves').delete().in('id',gone));
+    synced.h=cur;
+  }
+  if(purgeGuest){purgeGuest=false;NAMES.concat(['ts_p','ts_h']).forEach(n=>{try{localStorage.removeItem('ts:ck:'+n);document.cookie=n+'=; max-age=0; path=/'}catch(e){}})}
+}
+function report(e){
+  console.warn('TerraScan sync:',e);
+  if(Date.now()-lastReport<60000)return;lastReport=Date.now();
+  toast('Could not save to the server: '+tr(e)+'. Your latest changes may not be saved.');
+}
+function flush(){clearTimeout(ft);const run=chain.then(syncAll).then(()=>true,e=>{report(e);return false});chain=run;return run}
 function put(n,v){T.vault[n]=v;clearTimeout(ft);ft=setTimeout(flush,300)}
-function drop(n){delete T.vault[n];clearTimeout(ft);ft=setTimeout(flush,300)}
-async function flush(){if(!T.user)return;clearTimeout(ft);try{if(!wr('v:'+T.user.id,await seal(T.key,T.vault)))alert('Could not save: browser storage is full.')}catch(e){}}
-addEventListener('visibilitychange',()=>{if(document.hidden)flush()});
-async function logout(){await flush();sessionStorage.removeItem(K+'s');sessionStorage.removeItem(K+'guest');location.hash='';location.reload()}
+function drop(n){delete T.vault[n];dropped[n]=true;clearTimeout(ft);ft=setTimeout(flush,300)}
+addEventListener('visibilitychange',()=>{if(document.hidden&&T.user)flush()});
 
+/* ---------- session ---------- */
+async function startSession(user){
+  T.user={email:user.email,id:user.id};
+  try{await loadVault()}catch(e){T.user=null;T.vault={};throw e}
+}
+async function logout(){
+  leaving=true;
+  try{await flush()}catch(e){}
+  try{if(sb)await sb.auth.signOut()}catch(e){}
+  sessionStorage.removeItem(K+'guest');location.hash='';location.reload();
+}
 async function register(email,pw,name){
-  if(!secure())throw new Error('Accounts only work on a secure address (HTTPS).');
-  const us=rd('users',{});if(us[email])throw new Error('This email is already registered. Please log in.');
-  const salt=crypto.getRandomValues(new Uint8Array(16)),key=await derive(pw,salt,ITER);
-  const id=b64(crypto.getRandomValues(new Uint8Array(9))).replace(/[^a-z0-9]/gi,'x'),vault={};
-  NAMES.forEach(n=>{try{const o=JSON.parse(localStorage.getItem('ts:ck:'+n));if(o&&o.v!=null)vault[n]=o.v}catch(e){}});   // transferring guest data
-  vault.ts_p=Object.assign({color:0,since:Date.now()},vault.ts_p,{name:(name||email.split('@')[0]).slice(0,30)});
-  if(!wr('v:'+id,await seal(key,vault)))throw new Error('Could not save: browser storage is full.');
-  us[email]={id,salt:b64(salt),iter:ITER,created:Date.now()};wr('users',us);
-  NAMES.forEach(n=>{try{localStorage.removeItem('ts:ck:'+n);document.cookie=n+'=; max-age=0; path=/'}catch(e){}});
-  await startSession(email,id,key,vault);
+  const r=await sb.auth.signUp({email,password:pw,options:{data:{name:(name||email.split('@')[0]).slice(0,30)},emailRedirectTo:REDIRECT}});
+  if(r.error)throw new Error(tr(r.error));
+  const u=r.data&&r.data.user;
+  if(u&&Array.isArray(u.identities)&&!u.identities.length)throw new Error('This email is already registered. Please log in.');
+  if(!r.data.session)return{confirm:true};
+  try{await startSession(r.data.session.user)}catch(e){throw new Error('Account created, but the data could not be loaded: '+tr(e))}
+  return{};
 }
 async function login(email,pw){
-  if(!secure())throw new Error('Accounts only work on a secure address (HTTPS).');
-  const w=waitLeft(email);if(w)throw new Error('Too many attempts. Wait '+w+' s.');
-  const u=rd('users',{})[email],key=await derive(pw,u?unb(u.salt):crypto.getRandomValues(new Uint8Array(16)),u?u.iter:ITER);
-  let vault;try{if(!u)throw 0;vault=await open(key,rd('v:'+u.id))}catch(e){failed(email);throw new Error('Incorrect email or password.')}
-  cleared(email);await startSession(email,u.id,key,vault);
+  const r=await sb.auth.signInWithPassword({email,password:pw});
+  if(r.error)throw new Error(tr(r.error));
+  try{await startSession(r.data.user)}
+  catch(e){try{await sb.auth.signOut()}catch(x){}throw new Error('Signed in, but could not load your data: '+tr(e))}
 }
 
+/* ---------- sign-in window ---------- */
 function openGate(closable){
+  if(!sb){alert('Accounts are unavailable: the Supabase library did not load. Check your connection and reload the page.');return}
   const old=g('authgate');if(old)old.remove();
   const d=document.createElement('div');d.id='authgate';d.className='modal';d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');d.setAttribute('aria-labelledby','ag-h');
   d.innerHTML='<div class="modal-back" id="ag-b"></div><div class="modal-card agc">'+(closable?'<button class="modal-x" type="button" id="ag-x" aria-label="Close">×</button>':'')+
@@ -662,51 +755,84 @@ function openGate(closable){
   '<div class="mono agn" id="ag-m" hidden></div>'+
   '<label class="fl" id="ag-p2l" hidden>Repeat password<input id="ag-p2" type="password" maxlength="128" autocomplete="new-password"></label>'+
   '<label class="chk"><input type="checkbox" id="ag-s"> Show password</label><p class="err mono" id="ag-err" role="alert"></p>'+
-  '<button class="btn full" id="ag-go" type="submit">Log in</button></form>'+
+  '<button class="btn full" id="ag-go" type="submit">Log in</button>'+
+  '<button class="btn ghost full" id="ag-fp" type="button">Forgot password?</button></form>'+
   '<p class="mono agn" id="ag-note"></p>'+(closable?'':'<button class="btn ghost full" id="ag-g" type="button">Continue without an account</button>')+'</div>';
   document.body.appendChild(d);
   let reg=false;const E=g('ag-e'),P=g('ag-p'),P2=g('ag-p2'),err=g('ag-err');
   const close=()=>{d.remove();document.body.classList.remove('locked')};
   function mode(r){reg=r;g('ag-t1').setAttribute('aria-selected',!r);g('ag-t2').setAttribute('aria-selected',r);g('ag-h').textContent=r?'Sign up':'Log in';
-    g('ag-nl').hidden=g('ag-p2l').hidden=g('ag-m').hidden=!r;g('ag-go').textContent=r?'Create account':'Log in';P.autocomplete=r?'new-password':'current-password';err.textContent='';
-    g('ag-note').textContent=r?'Your data is encrypted with your password (AES-256) and stored in this browser. A forgotten password cannot be recovered: make a backup copy in your profile.':'No account? Open the “Sign up” tab.'}
+    g('ag-nl').hidden=g('ag-p2l').hidden=g('ag-m').hidden=!r;g('ag-fp').hidden=r;g('ag-go').textContent=r?'Create account':'Log in';P.autocomplete=r?'new-password':'current-password';err.textContent='';err.style.color='';
+    g('ag-note').textContent=r?'Your data is stored in your account and is available on any device. We will email you a link to confirm your address.':'No account? Open the “Sign up” tab.'}
   mode(false);
   g('ag-t1').onclick=()=>mode(false);g('ag-t2').onclick=()=>mode(true);
   g('ag-s').onchange=e=>{P.type=P2.type=e.target.checked?'text':'password'};
   P.oninput=()=>{if(reg)g('ag-m').textContent=P.value?'Strength: '+meter(P.value)+'. At least 8 characters, letters and digits.':'At least 8 characters, letters and digits.'};
-  g('ag-f').onsubmit=async ev=>{ev.preventDefault();err.textContent='';const em=normEmail(E.value),pw=P.value,b=g('ag-go');
+  g('ag-f').onsubmit=async ev=>{ev.preventDefault();err.textContent='';err.style.color='';const em=normEmail(E.value),pw=P.value,b=g('ag-go');
     try{
       if(!okEmail(em))throw new Error('Enter a valid email.');
       if(!pw)throw new Error('Enter your password.');
       if(reg){const pe=policy(pw,em);if(pe)throw new Error(pe);if(pw!==P2.value)throw new Error('Passwords do not match.')}
       b.disabled=true;b.textContent='Checking…';
-      if(reg)await register(em,pw,g('ag-n').value.trim());else await login(em,pw);
-      if(gateFirst){close();resolveReady()}else location.reload();
-    }catch(e){err.textContent=e.message||'Error.';b.disabled=false;b.textContent=reg?'Create account':'Log in'}};
+      let res={};
+      if(reg)res=await register(em,pw,g('ag-n').value.trim());else await login(em,pw);
+      if(res.confirm){mode(false);b.disabled=false;err.style.color='var(--good)';err.textContent='We sent a confirmation link to '+em+'. Open it, then log in.';return}
+      if(gateFirst){close();done()}else location.reload();
+    }catch(e){err.style.color='';err.textContent=e.message||'Error.';b.disabled=false;b.textContent=reg?'Create account':'Log in'}};
+  g('ag-fp').onclick=async()=>{
+    err.textContent='';err.style.color='';const em=normEmail(E.value);
+    if(!okEmail(em)){err.textContent='Enter your email above first.';return}
+    const b=g('ag-fp');b.disabled=true;
+    try{const r=await sb.auth.resetPasswordForEmail(em,{redirectTo:REDIRECT});if(r.error)throw r.error;err.style.color='var(--good)';err.textContent='If this email is registered, a reset link has been sent.'}
+    catch(e){err.textContent=tr(e)}
+    b.disabled=false};
   if(closable){g('ag-x').onclick=g('ag-b').onclick=close;d.onkeydown=e=>{if(e.key==='Escape')close()}}
-  else g('ag-g').onclick=()=>{sessionStorage.setItem(K+'guest','1');close();resolveReady()};
+  else g('ag-g').onclick=()=>{sessionStorage.setItem(K+'guest','1');close();done()};
   E.focus();
 }
+/* opened from the link in the password reset email */
+function openRecovery(){
+  const old=g('authgate');if(old)old.remove();
+  const d=document.createElement('div');d.id='authgate';d.className='modal';d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');d.setAttribute('aria-labelledby','ag-h');
+  d.innerHTML='<div class="modal-back" id="rc-b"></div><div class="modal-card agc"><button class="modal-x" type="button" id="rc-x" aria-label="Close">×</button>'+
+  '<div class="eyebrow">TerraScan · account</div><h2 id="ag-h">New password</h2>'+
+  '<form id="rc-f" novalidate><label class="fl">New password<input id="rc-p" type="password" maxlength="128" autocomplete="new-password"></label>'+
+  '<label class="fl">Repeat password<input id="rc-p2" type="password" maxlength="128" autocomplete="new-password"></label>'+
+  '<p class="err mono" id="rc-e" role="alert"></p><button class="btn full" type="submit">Save password</button></form></div>';
+  document.body.appendChild(d);
+  const close=()=>d.remove(),err=g('rc-e');
+  g('rc-x').onclick=g('rc-b').onclick=close;d.onkeydown=e=>{if(e.key==='Escape')close()};
+  g('rc-f').onsubmit=async ev=>{ev.preventDefault();err.textContent='';
+    try{
+      const n=g('rc-p').value;if(n!==g('rc-p2').value)throw new Error('Passwords do not match.');
+      const pe=policy(n,T.user?T.user.email:'');if(pe)throw new Error(pe);
+      const r=await sb.auth.updateUser({password:n});if(r.error)throw r.error;
+      close();toast('Password changed.',true);
+    }catch(e){err.textContent=tr(e)}};
+  g('rc-p').focus();
+}
 
+/* ---------- profile: security block ---------- */
 function secPanel(){
   const box=g('prof-body');if(!box)return;const p=document.createElement('div');p.className='panel';p.style.gridColumn='1/-1';box.appendChild(p);
-  if(!T.user){p.innerHTML='<div class="eyebrow">Account</div><p style="margin:8px 0 12px;color:var(--muted)">You are not signed in right now: your data is stored in this browser unencrypted. Create an account and it will be encrypted with your password.</p><button class="btn" id="sp-reg" type="button">Create an account or log in</button>';g('sp-reg').onclick=()=>openGate(true);return}
-  g('prof-lead').textContent='You are logged in as '+T.user.email+'. Your data is encrypted with your password.';
+  if(!T.user){
+    p.innerHTML='<div class="eyebrow">Account</div><p style="margin:8px 0 12px;color:var(--muted)">You are not signed in: your data is stored only in this browser. Create an account and it will be saved to the cloud and be available on any device.</p><button class="btn" id="sp-reg" type="button">Create an account or log in</button>';
+    g('sp-reg').onclick=()=>openGate(true);return;
+  }
+  g('prof-lead').textContent='You are logged in as '+T.user.email+'. Your data is stored in your account and syncs across devices.';
   p.innerHTML='<div class="eyebrow" style="margin-bottom:10px">Security and data · '+esc(T.user.email)+'</div>'+
   '<form class="spf" id="sp-cp" novalidate><label class="fl">Current password<input id="sp-o" type="password" autocomplete="current-password"></label><label class="fl">New password<input id="sp-n" type="password" autocomplete="new-password"></label><label class="fl">Repeat new password<input id="sp-c" type="password" autocomplete="new-password"></label><button class="btn" type="submit" style="margin-bottom:12px">Change password</button></form>'+
   '<p class="err mono" id="sp-m" role="alert"></p>'+
   '<div class="cta"><button class="btn ghost" id="sp-ex" type="button">Download backup</button><button class="btn ghost" id="sp-im" type="button">Upload backup</button><button class="btn ghost" id="sp-lo" type="button">Log out</button></div><input type="file" id="sp-f" accept="application/json,.json" hidden>'+
-  '<p class="mono" style="color:var(--muted);margin:10px 0 14px">The backup contains your data in plain text: keep it in a safe place. The session closes after 30 minutes of inactivity and when the tab is closed.</p>'+
+  '<p class="mono" style="color:var(--muted);margin:10px 0 14px">The backup file contains your data in plain text: keep it in a safe place.</p>'+
   '<form class="spf" id="sp-dl" novalidate><label class="fl">Password to delete the account<input id="sp-dp" type="password" autocomplete="current-password"></label><button class="btn danger" type="submit" style="margin-bottom:12px">Delete account and data</button></form>';
   const m=g('sp-m'),say=(t,bad)=>{m.textContent=t;m.style.color=bad?'':'var(--good)'};
-  const verify=async pw=>{const r=rd('users',{})[T.user.email];try{await open(await derive(pw,unb(r.salt),r.iter),rd('v:'+T.user.id));return r}catch(e){throw new Error('Incorrect password.')}};
+  const verify=async pw=>{const r=await sb.auth.signInWithPassword({email:T.user.email,password:pw});if(r.error)throw new Error('Incorrect password.')};
   g('sp-lo').onclick=logout;
   g('sp-cp').onsubmit=async e=>{e.preventDefault();say('',1);try{
-    const o=g('sp-o').value,n=g('sp-n').value;if(n!==g('sp-c').value)throw new Error('The new passwords do not match.');const pe=policy(n,T.user.email);if(pe)throw new Error(pe);
-    await verify(o);const salt=crypto.getRandomValues(new Uint8Array(16)),key=await derive(n,salt,ITER);
-    if(!wr('v:'+T.user.id,await seal(key,T.vault)))throw new Error('Browser storage is full.');
-    const us=rd('users',{});us[T.user.email]=Object.assign(us[T.user.email],{salt:b64(salt),iter:ITER});wr('users',us);
-    T.key=key;const s=sess();s.k=b64(await crypto.subtle.exportKey('raw',key));sessionStorage.setItem(K+'s',JSON.stringify(s));
+    const o=g('sp-o').value,n=g('sp-n').value;if(n!==g('sp-c').value)throw new Error('The new passwords do not match.');
+    const pe=policy(n,T.user.email);if(pe)throw new Error(pe);
+    await verify(o);const r=await sb.auth.updateUser({password:n});if(r.error)throw new Error(tr(r.error));
     e.target.reset();say('Password changed.')}catch(x){say(x.message,1)}};
   g('sp-ex').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({app:'TerraScan',v:1,data:T.vault})],{type:'application/json'}));a.download='terrascan-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
   g('sp-im').onclick=()=>g('sp-f').click();
@@ -714,18 +840,34 @@ function secPanel(){
     if(f.size>3e6)throw new Error('The file is too large.');const j=JSON.parse(await f.text());
     if(!j||j.app!=='TerraScan'||!j.data||typeof j.data!=='object')throw new Error('This is not a TerraScan backup.');
     if(!confirm('Replace saves, point and settings with the data from the file?'))return;
-    ['ts_s','ts_u','ts_h','ts_h2'].forEach(n=>{if(j.data[n]!=null)T.vault[n]=j.data[n]});await flush();location.reload()}catch(x){say(x.message,1)}};
+    ['ts_s','ts_u'].forEach(n=>{if(j.data[n]!=null)T.vault[n]=j.data[n]});
+    if(Array.isArray(j.data.ts_h2))T.vault.ts_h2=j.data.ts_h2.filter(x=>x&&typeof x==='object').slice(0,30).map(x=>Object.assign({},x,{id:UUID.test(x.id)?x.id:newId()}));
+    if(await flush())location.reload();else say('Could not upload the data to the server.',1)}catch(x){say(x.message,1)}};
   g('sp-dl').onsubmit=async e=>{e.preventDefault();say('',1);try{
     await verify(g('sp-dp').value);if(!confirm('The account and all its data will be permanently deleted. Continue?'))return;
-    const us=rd('users',{});delete us[T.user.email];wr('users',us);localStorage.removeItem(K+'v:'+T.user.id);T.user=null;sessionStorage.removeItem(K+'s');location.hash='';location.reload()}catch(x){say(x.message,1)}};
+    const r=await sb.rpc('delete_my_account');if(r.error)throw new Error(tr(r.error)+' (is delete_my_account installed? see the second SQL file)');
+    leaving=true;try{await sb.auth.signOut()}catch(x){}
+    sessionStorage.removeItem(K+'guest');location.hash='';location.reload()}catch(x){say(x.message,1)}};
 }
 
+/* ---------- startup ---------- */
+function done(){isReady=true;resolveReady();if(recovery)openRecovery()}
 (async function init(){
-  if(secure()&&await restore())return resolveReady();
-  if(sessionStorage.getItem(K+'guest')||!secure())return resolveReady();
+  if(!sb)return done();
+  sb.auth.onAuthStateChange(ev=>{
+    if(ev==='PASSWORD_RECOVERY'){recovery=true;if(isReady)openRecovery()}
+    else if(ev==='SIGNED_OUT'&&T.user&&!leaving)location.reload();
+  });
+  let sess=null;
+  try{const r=await sb.auth.getSession();sess=r.data&&r.data.session}catch(e){}
+  if(sess){
+    try{await startSession(sess.user)}catch(e){toast('Could not load your data from the server: '+tr(e))}
+    return done();
+  }
+  if(sessionStorage.getItem(K+'guest'))return done();
   gateFirst=true;document.body.classList.add('locked');openGate(false);
 })();
-return{ready,get user(){return T.user},get vault(){return T.vault},put,drop,logout,openGate,secPanel};
+return{ready,get user(){return T.user},get vault(){return T.vault},get sb(){return sb},put,drop,flush,logout,openGate,secPanel};
 })();
 </script>
 
@@ -1082,12 +1224,16 @@ function scan(force) {
 }
 $('risks').addEventListener('click', e => { const b = e.target.closest('[data-retry]'); if (b) runLayer(b.dataset.retry, scanSeq); });
 
+let lastScanKey = '';
 function saveScan() {
   if (!CLIM) return;
   const body = { name: SEL.name, lat: SEL.lat, lon: SEL.lon, area_ha: SEL.area == null ? null : SEL.area,
     result: { water: CLIM.water, heat: CLIM.heat, frost: CLIM.frost, deficit: CLIM.deficit, heatDays: CLIM.heatDays,
       frostDays: CLIM.frostDays, sumP: CLIM.sumP, sumE: CLIM.sumE, days: CLIM.days, period: CLIM.period } };
-  fetch('/api/scans', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {});
+  const sbc = TSAUTH.sb, sk = SEL.lat + ',' + SEL.lon + '|' + CLIM.period;
+  if (!sbc || !TSAUTH.user || sk === lastScanKey) return;
+  lastScanKey = sk;
+  sbc.from('scans').insert({ name: body.name, lat: body.lat, lon: body.lon, area_ha: body.area_ha, result: body.result }).then(() => {}, () => {});
 }
 function riskCard(name, val, detail, note) {
   return '<div class="risk lv' + lv(val) + '"><div class="top"><h3>' + name + '</h3><span class="val">' + val + '</span></div>' +
@@ -1234,10 +1380,14 @@ function li(a) { return '<ul>' + a.map(x => '<li>' + esc(x) + '</li>').join('') 
 function esc(x) { return String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 async function loadRotations() {
   try {
-    const r = await fetch('/api/rotations');
-    if (!r.ok) return;
-    const j = await r.json();
-    if (Array.isArray(j) && j.length) { ROTS = j; }
+    const sbc = TSAUTH.sb; if (!sbc) return;
+    const r = await sbc.from('rotations').select('name,seq,scores,why,evid,pros,gaps,chk').eq('active', true).eq('lang', document.documentElement.lang || 'en').order('sort');
+    if (r.error || !Array.isArray(r.data)) return;
+    const arr = x => Array.isArray(x) ? x.map(String) : [];
+    const list = r.data.filter(x => x && x.name && x.seq && x.scores && typeof x.scores === 'object').map(x => ({
+      n: String(x.name), seq: String(x.seq), s: Object.assign({ water: 0, soil: 0, income: 0, simplicity: 0 }, x.scores),
+      why: String(x.why || ''), evid: arr(x.evid), pros: arr(x.pros), gaps: arr(x.gaps), chk: arr(x.chk) }));
+    if (list.length) ROTS = list;
   } catch (e) { /* working with the built-in data */ }
 }
 function renderAll() { renderRisks(); drawPrio(); drawRank(); renderPlan(); }
@@ -1493,11 +1643,17 @@ if (!PROF || typeof PROF.name !== 'string') PROF = { name: 'Guest', color: 0, si
 PROF.name = PROF.name.slice(0, 30) || 'Guest';
 if (!(PROF.color >= 0 && PROF.color < COLORS.length)) PROF.color = 0;
 if (!okNum(PROF.since)) PROF.since = Date.now();
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const uid = () => {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = b[6] & 15 | 64; b[8] = b[8] & 63 | 128;
+  const h = Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+  return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+};
 function cleanEntry(x) {
   if (!x || typeof x !== 'object' || !okNum(x.la) || !okNum(x.lo) || Math.abs(x.la) > 90 || Math.abs(x.lo) > 180) return null;
   const e = {
-    id: typeof x.id === 'string' ? x.id.slice(0, 20) : uid(), t: okNum(x.t) ? x.t : Date.now(),
+    id: typeof x.id === 'string' && UUID_RE.test(x.id) ? x.id : uid(), t: okNum(x.t) ? x.t : Date.now(),
     name: typeof x.name === 'string' ? x.name.slice(0, 60) : '', pn: String(x.pn || 'Selected point').slice(0, 60),
     la: x.la, lo: x.lo, a: okNum(x.a) ? x.a : null, rot: typeof x.rot === 'string' ? x.rot.slice(0, 60) : '',
     c: Array.isArray(x.c) && x.c.length === 3 && x.c.every(okNum) ? x.c : null, w: null, poly: null,
@@ -1539,7 +1695,7 @@ function restoreState() {
   if (u.zl === 'max' || /^\d{1,2}$/.test(String(u.zl))) zLayer = String(u.zl);
   { const g = String(u.sg || '').split('x').map(Number); if (GRIDS.some(x => x[0] === g[0] && x[1] === g[1])) GRID = g; }
   if (u.zs >= 0 && u.zs < 9) ZSEL = Math.floor(u.zs);
-  if (typeof u.cur === 'string') CUR = u.cur.slice(0, 20);
+  if (typeof u.cur === 'string') CUR = u.cur.slice(0, 40);
   const q = s.sel;
   if (q && okNum(q.la) && okNum(q.lo) && Math.abs(q.la) <= 90 && Math.abs(q.lo) <= 180) {
     SEL = { name: String(q.n || 'Selected point').slice(0, 60), lat: q.la, lon: q.lo };
@@ -1612,7 +1768,7 @@ function renderProfile() {
     COLORS.map((c, i) => '<button type="button" data-c="' + i + '" style="background:' + c + '" aria-pressed="' + (i === PROF.color) + '" aria-label="Color ' + (i + 1) + '"></button>').join('') + '</div>' +
     '<div class="pstats"><span>First visit: ' + new Date(PROF.since).toLocaleDateString('en-US') + '</span><span>Saves: ' + HIST.length + '</span></div>' +
     '<button class="btn ghost full" id="resetall" type="button" style="margin-top:0">Reset profile and saves</button>' +
-    '<p class="mono" style="color:var(--muted);margin-top:10px">Data is stored for a year and stays only in this browser. On another device or in incognito mode the profile will be empty.</p></div>' +
+    (TSAUTH.user ? '<p class="mono" style="color:var(--muted);margin-top:10px">Your data is stored in your account and is available on any device after you log in.</p></div>' : '<p class="mono" style="color:var(--muted);margin-top:10px">Data is stored for a year and stays only in this browser. On another device or in incognito mode the profile will be empty. Log in to keep it in the cloud.</p></div>') +
     '<div class="panel"><div class="eyebrow" style="margin-bottom:10px">My saves: point and plan</div>' +
     (HIST.length ? '<ul class="hist">' + HIST.map((x, i) =>
       '<li><input class="tt" type="text" maxlength="60" data-n="' + i + '" value="' + esc(entryTitle(x)) + '" aria-label="Save name" placeholder="Name">' +
@@ -1637,7 +1793,7 @@ function renderProfile() {
     if (!confirm('Delete the profile, saves and all settings?')) return;
     NOSAVE = true; clearTimeout(pT);
     CK_NAMES.forEach(store.clear);
-    location.hash = ''; location.reload();
+    Promise.resolve(TSAUTH.user ? TSAUTH.flush() : 0).then(() => { location.hash = ''; location.reload(); });
   };
 }
 
